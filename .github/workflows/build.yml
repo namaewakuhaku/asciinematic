@@ -31,9 +31,19 @@ jobs:
 
       - name: Build Linux and Windows binaries
         run: |
-          cross build --locked --release --target x86_64-unknown-linux-musl
-          cross build --locked --release --target aarch64-unknown-linux-musl
-          cross build --locked --release --target x86_64-pc-windows-gnu
+          # Build scripts run on each cross image's host architecture. Keep their
+          # caches separate so a binary linked against one image's glibc is never
+          # reused inside another image.
+          install -d -m 0777 \
+            target/cross-x86_64-linux \
+            target/cross-aarch64-linux \
+            target/cross-x86_64-windows
+          CARGO_TARGET_DIR=target/cross-x86_64-linux \
+            cross build --locked --release --target x86_64-unknown-linux-musl
+          CARGO_TARGET_DIR=target/cross-aarch64-linux \
+            cross build --locked --release --target aarch64-unknown-linux-musl
+          CARGO_TARGET_DIR=target/cross-x86_64-windows \
+            cross build --locked --release --target x86_64-pc-windows-gnu
 
       # cross cannot distribute Apple SDK images. cargo-zigbuild's official image
       # includes the SDK and produces a universal Intel + Apple Silicon executable.
@@ -54,21 +64,21 @@ jobs:
             dist/macos-universal
 
           install -m 0755 \
-            target/x86_64-unknown-linux-musl/release/ascn \
+            target/cross-x86_64-linux/x86_64-unknown-linux-musl/release/ascn \
             dist/linux-x86_64/ascn
           cp README.md dist/linux-x86_64/
           tar -C dist/linux-x86_64 -czf \
             dist/ascn-linux-x86_64.tar.gz .
 
           install -m 0755 \
-            target/aarch64-unknown-linux-musl/release/ascn \
+            target/cross-aarch64-linux/aarch64-unknown-linux-musl/release/ascn \
             dist/linux-aarch64/ascn
           cp README.md dist/linux-aarch64/
           tar -C dist/linux-aarch64 -czf \
             dist/ascn-linux-aarch64.tar.gz .
 
           install -m 0755 \
-            target/x86_64-pc-windows-gnu/release/ascn.exe \
+            target/cross-x86_64-windows/x86_64-pc-windows-gnu/release/ascn.exe \
             dist/windows-x86_64/ascn.exe
           cp README.md dist/windows-x86_64/
           (

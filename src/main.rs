@@ -13,7 +13,7 @@ fn main() {
         return;
     }
     if let Err(error) = run() {
-        eprintln!("asciinematic: {error:#}");
+        eprintln!("ascn: {error:#}");
         std::process::exit(1);
     }
 }
@@ -28,7 +28,7 @@ fn run() -> Result<()> {
         anyhow::ensure!(
             matches!(argument.to_str(), Some("sessions" | "--sessions"))
                 && arguments.next().is_none(),
-            "usage: asciinematic [sessions]"
+            "usage: ascn [sessions]"
         );
         return tui::sessions_menu(&data_dir);
     }

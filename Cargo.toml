@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "A command-aware terminal session recorder"
 license = "MIT"
+autobins = false
+
+[[bin]]
+name = "ascn"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"

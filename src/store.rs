@@ -8,13 +8,18 @@ use anyhow::{Context, Result};
 use directories::BaseDirs;
 use rusqlite::{Connection, params};
 
+use crate::text;
+
 pub const OUTPUT: i64 = 0;
 pub const INPUT: i64 = 1;
+pub const APPLICATION_ID: i64 = 0x4153_4349; // "ASCI"
+pub const FORMAT_VERSION: i64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Session {
     pub id: String,
     pub name: String,
+    pub summary: String,
     pub started_at: i64,
     pub duration_us: i64,
     pub command_count: i64,
@@ -34,15 +39,18 @@ pub fn default_data_dir() -> Result<PathBuf> {
     Ok(base.config_dir().join("asciinematic"))
 }
 
-pub fn create_session(dir: &Path, id: &str, name: &str, program: &str) -> Result<PathBuf> {
+pub fn create_session(dir: &Path, id: &str, program: &str) -> Result<PathBuf> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create session directory {}", dir.display()))?;
-    let path = dir.join(format!("{id}.sqlite3"));
+    let path = dir.join(id);
+    anyhow::ensure!(!path.exists(), "session id collision at {}", path.display());
     let conn = Connection::open(&path)?;
+    conn.pragma_update(None, "application_id", APPLICATION_ID)?;
+    conn.pragma_update(None, "user_version", FORMAT_VERSION)?;
     conn.execute_batch(
         "
-        PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
+        PRAGMA journal_mode = DELETE;
+        PRAGMA synchronous = FULL;
         CREATE TABLE metadata (
             key   TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -68,14 +76,17 @@ pub fn create_session(dir: &Path, id: &str, name: &str, program: &str) -> Result
         .unwrap_or_default()
         .as_secs()
         .to_string();
-    for (key, value) in [
-        ("format_version", "1"),
+    let format_version = FORMAT_VERSION.to_string();
+    let metadata: [(&str, &str); 7] = [
+        ("format_version", format_version.as_str()),
         ("id", id),
-        ("name", name),
+        ("name", id),
+        ("summary", ""),
         ("program", program),
         ("started_at", &started_at),
         ("duration_us", "0"),
-    ] {
+    ];
+    for (key, value) in metadata {
         conn.execute(
             "INSERT INTO metadata(key, value) VALUES (?1, ?2)",
             params![key, value],
@@ -87,6 +98,7 @@ pub fn create_session(dir: &Path, id: &str, name: &str, program: &str) -> Result
 pub fn open_event_writer(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(conn)
 }
 
@@ -112,6 +124,7 @@ pub fn add_command(conn: &Connection, ordinal: i64, started_us: i64, input: &[u8
 
 pub fn finish(path: &Path, duration_us: i64) -> Result<()> {
     let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute(
         "UPDATE commands SET ended_us = ?1 WHERE ended_us IS NULL",
         [duration_us],
@@ -120,6 +133,10 @@ pub fn finish(path: &Path, duration_us: i64) -> Result<()> {
         "UPDATE metadata SET value = ?1 WHERE key = 'duration_us'",
         [duration_us.to_string()],
     )?;
+    // Convert older WAL recordings to the single-file format after all event writers stop.
+    conn.pragma_update(None, "journal_mode", "DELETE")?;
+    drop(conn);
+    remove_sqlite_sidecars(path)?;
     Ok(())
 }
 
@@ -133,6 +150,81 @@ pub fn checkpoint(path: &Path, duration_us: i64) -> Result<()> {
     Ok(())
 }
 
+pub fn set_summary(path: &Path, summary: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES ('summary', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [summary],
+    )?;
+    Ok(())
+}
+
+pub fn rename_session(path: &Path, requested_name: &str) -> Result<String> {
+    let name = requested_name
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "session name cannot be empty");
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES ('name', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [name],
+    )?;
+    Ok(name.to_owned())
+}
+
+/// Delete a recording that contains no activity beyond leaving the shell.
+///
+/// Shell startup prompts are output events, so event count alone cannot distinguish an
+/// empty recording. A submitted command other than `exit`/`logout` makes it worth keeping.
+pub fn has_user_activity(path: &Path) -> Result<bool> {
+    Ok(commands(path)?.iter().any(|command| {
+        let input = text::display_input(&command.input);
+        !matches!(
+            input.split_whitespace().next(),
+            None | Some("exit" | "logout")
+        )
+    }))
+}
+
+pub fn discard_if_empty(path: &Path) -> Result<bool> {
+    if has_user_activity(path)? {
+        return Ok(false);
+    }
+
+    remove_sqlite_sidecars(path)?;
+    if path.exists() {
+        fs::remove_file(path)
+            .with_context(|| format!("failed to remove empty session {}", path.display()))?;
+    }
+    Ok(true)
+}
+
+fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            fs::remove_file(&sidecar)
+                .with_context(|| format!("failed to remove {}", sidecar.display()))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn list_sessions(dir: &Path) -> Result<Vec<Session>> {
     if !dir.exists() {
         return Ok(Vec::new());
@@ -140,10 +232,7 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if !matches!(
-            path.extension().and_then(|v| v.to_str()),
-            Some("sqlite3" | "sqlite")
-        ) {
+        if !path.is_file() {
             continue;
         }
         if let Ok(session) = read_session(&path) {
@@ -156,6 +245,19 @@ pub fn list_sessions(dir: &Path) -> Result<Vec<Session>> {
 
 pub fn read_session(path: &Path) -> Result<Session> {
     let conn = Connection::open(path)?;
+    let application_id: i64 = conn.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        application_id == APPLICATION_ID || application_id == 0,
+        "{} is not an asciinematic session",
+        path.display()
+    );
+    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    anyhow::ensure!(
+        user_version <= FORMAT_VERSION,
+        "{} uses unsupported session format version {}",
+        path.display(),
+        user_version
+    );
     let meta = |key: &str| -> Result<String> {
         conn.query_row("SELECT value FROM metadata WHERE key = ?1", [key], |row| {
             row.get(0)
@@ -163,9 +265,23 @@ pub fn read_session(path: &Path) -> Result<Session> {
         .with_context(|| format!("missing {key} metadata"))
     };
     let command_count = conn.query_row("SELECT count(*) FROM commands", [], |row| row.get(0))?;
+    let summary = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'summary'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or_default();
+    let id = meta("id")?;
+    let name = conn
+        .query_row("SELECT value FROM metadata WHERE key = 'name'", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or_else(|_| id.clone());
     Ok(Session {
-        id: meta("id")?,
-        name: meta("name")?,
+        id,
+        name,
+        summary,
         started_at: meta("started_at")?.parse().unwrap_or_default(),
         duration_us: meta("duration_us")?.parse().unwrap_or_default(),
         command_count,
@@ -251,7 +367,6 @@ pub fn save_range_as_session(
     first: &CommandItem,
     last: &CommandItem,
     id: &str,
-    name: &str,
 ) -> Result<PathBuf> {
     let source_conn = Connection::open(source)?;
     let program: String = source_conn.query_row(
@@ -259,7 +374,7 @@ pub fn save_range_as_session(
         [],
         |row| row.get(0),
     )?;
-    let destination = create_session(dir, id, name, &program)?;
+    let destination = create_session(dir, id, &program)?;
     let destination_conn = open_event_writer(&destination)?;
     let range_start = first.started_us;
     let range_end = last.ended_us.max(range_start);
@@ -308,24 +423,95 @@ mod tests {
     #[test]
     fn command_output_obeys_timeline_boundaries() -> Result<()> {
         let dir = std::env::temp_dir().join(format!("asciinematic-test-{}", uuid::Uuid::new_v4()));
-        let path = create_session(&dir, "test", "test", "sh")?;
+        let path = create_session(&dir, "test", "sh")?;
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("test")
+        );
+        assert!(path.extension().is_none());
+        let format = Connection::open(&path)?;
+        assert_eq!(
+            format.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))?,
+            APPLICATION_ID
+        );
+        assert_eq!(
+            format.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
+            FORMAT_VERSION
+        );
+        assert_eq!(
+            format.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?,
+            "delete"
+        );
+        drop(format);
         let conn = open_event_writer(&path)?;
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))?,
+            2
+        );
         add_command(&conn, 1, 10, b"echo one")?;
         append_event(&conn, 11, OUTPUT, b"one\r\n")?;
         add_command(&conn, 2, 20, b"echo two")?;
         append_event(&conn, 21, OUTPUT, b"two\r\n")?;
         drop(conn);
         finish(&path, 30)?;
+        assert!(!dir.join("test-wal").exists());
+        assert!(!dir.join("test-shm").exists());
+        set_summary(&path, "Built the project.\nAll tests passed.")?;
+        assert_eq!(
+            read_session(&path)?.summary,
+            "Built the project.\nAll tests passed."
+        );
+        assert_eq!(read_session(&path)?.name, "test");
+        assert_eq!(
+            rename_session(&path, "  release investigation\nignored  ")?,
+            "release investigation ignored"
+        );
+        assert_eq!(read_session(&path)?.name, "release investigation ignored");
         let items = commands(&path)?;
         assert_eq!(command_output(&path, &items[0])?, b"one\r\n");
         assert_eq!(command_output(&path, &items[1])?, b"two\r\n");
 
-        let clip = save_range_as_session(&path, &dir, &items[0], &items[1], "clip", "clip")?;
+        let clip = save_range_as_session(&path, &dir, &items[0], &items[1], "clip")?;
         let clipped_items = commands(&clip)?;
         assert_eq!(clipped_items.len(), 2);
         assert_eq!(clipped_items[0].started_us, 0);
         assert_eq!(command_output(&clip, &clipped_items[0])?, b"one\r\n");
         assert_eq!(command_output(&clip, &clipped_items[1])?, b"two\r\n");
+
+        let legacy = dir.join("legacy.sqlite3");
+        std::fs::copy(&path, &legacy)?;
+        Connection::open(&legacy)?.execute_batch(
+            "PRAGMA application_id = 0;
+             PRAGMA user_version = 0;
+             DELETE FROM metadata WHERE key = 'summary';",
+        )?;
+        assert!(read_session(&legacy)?.summary.is_empty());
+        std::fs::write(dir.join("commands.txt"), b"not a sqlite session")?;
+        let sessions = list_sessions(&dir)?;
+        assert!(sessions.iter().any(|session| session.path == legacy));
+        assert_eq!(sessions.len(), 3);
+
+        let empty = create_session(&dir, "empty", "sh")?;
+        let empty_conn = open_event_writer(&empty)?;
+        append_event(&empty_conn, 1, OUTPUT, b"sh$ ")?;
+        add_command(&empty_conn, 2, 2, b"exit")?;
+        drop(empty_conn);
+        finish(&empty, 3)?;
+        assert!(discard_if_empty(&empty)?);
+        assert!(!empty.exists());
+
+        let interrupted = create_session(&dir, "interrupted", "sh")?;
+        let interrupted_conn = open_event_writer(&interrupted)?;
+        add_command(&interrupted_conn, 1, 5, b"cargo build")?;
+        append_event(&interrupted_conn, 6, OUTPUT, b"Compiling dependency")?;
+        drop(interrupted_conn);
+        finish(&interrupted, 7)?;
+        assert!(!discard_if_empty(&interrupted)?);
+        let interrupted_commands = commands(&interrupted)?;
+        assert_eq!(
+            command_output(&interrupted, &interrupted_commands[0])?,
+            b"Compiling dependency"
+        );
 
         std::fs::remove_dir_all(dir)?;
         Ok(())

@@ -7,8 +7,6 @@ mod tui;
 use std::{env, path::PathBuf};
 
 use anyhow::Result;
-use uuid::Uuid;
-
 fn main() {
     if let Some(path) = env::var_os(summary::WORKER_ENV) {
         let _ = summary::run_worker(&PathBuf::from(path));
@@ -37,29 +35,9 @@ fn run() -> Result<()> {
     let shell = env::var_os("SHELL")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-    let id = Uuid::new_v4().simple().to_string();
-    let path = store::create_session(&data_dir, &id, &shell.to_string_lossy())?;
-
-    eprintln!("Recording {id}. Press Ctrl-T twice for controls; exit the shell to finish.\r");
-    match record::run(&path, &shell) {
-        Ok(code) => {
-            if store::discard_if_empty(&path)? {
-                eprintln!("\r\nEmpty recording discarded.");
-            } else {
-                eprintln!("\r\nSaved {}.", path.display());
-            }
-            if code != 0 {
-                std::process::exit(code);
-            }
-        }
-        Err(error) => {
-            let duration_us = store::latest_event_time(&path).unwrap_or_default();
-            let _ = store::finish(&path, duration_us);
-            if matches!(store::discard_if_empty(&path), Ok(false)) {
-                let _ = summary::spawn_worker(&path);
-            }
-            return Err(error);
-        }
+    let (_, code) = record::record_new_session(&data_dir, &shell)?;
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }

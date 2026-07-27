@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use directories::BaseDirs;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::text;
 
@@ -14,6 +14,7 @@ pub const OUTPUT: i64 = 0;
 pub const INPUT: i64 = 1;
 pub const APPLICATION_ID: i64 = 0x4153_4349; // "ASCI"
 pub const FORMAT_VERSION: i64 = 2;
+pub const UNTITLED_TITLE: &str = "Untitled";
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -80,7 +81,7 @@ pub fn create_session(dir: &Path, id: &str, program: &str) -> Result<PathBuf> {
     let metadata: [(&str, &str); 7] = [
         ("format_version", format_version.as_str()),
         ("id", id),
-        ("name", id),
+        ("name", UNTITLED_TITLE),
         ("summary", ""),
         ("program", program),
         ("started_at", &started_at),
@@ -151,7 +152,7 @@ pub fn checkpoint(path: &Path, duration_us: i64) -> Result<()> {
 }
 
 pub fn set_summary(path: &Path, summary: &str) -> Result<()> {
-    let conn = Connection::open(path)?;
+    let conn = open_existing(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute(
         "INSERT INTO metadata(key, value) VALUES ('summary', ?1)
@@ -161,7 +162,45 @@ pub fn set_summary(path: &Path, summary: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn set_generated_title(path: &Path, requested_title: &str) -> Result<bool> {
+    let title = clean_session_name(requested_title, 60)?;
+    let conn = open_existing(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let updated = conn.execute(
+        "UPDATE metadata SET value = ?1
+         WHERE key = 'name'
+           AND (
+               trim(value) = ''
+               OR value = ?2
+               OR value = (SELECT value FROM metadata WHERE key = 'id')
+           )",
+        params![title.as_str(), UNTITLED_TITLE],
+    )?;
+    if updated > 0 {
+        return Ok(true);
+    }
+    let inserted = conn.execute(
+        "INSERT INTO metadata(key, value)
+         SELECT 'name', ?1
+         WHERE NOT EXISTS (SELECT 1 FROM metadata WHERE key = 'name')",
+        [title.as_str()],
+    )?;
+    Ok(inserted > 0)
+}
+
 pub fn rename_session(path: &Path, requested_name: &str) -> Result<String> {
+    let name = clean_session_name(requested_name, 80)?;
+    let conn = open_existing(path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute(
+        "INSERT INTO metadata(key, value) VALUES ('name', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [name.as_str()],
+    )?;
+    Ok(name)
+}
+
+fn clean_session_name(requested_name: &str, max_characters: usize) -> Result<String> {
     let name = requested_name
         .chars()
         .map(|character| {
@@ -171,18 +210,28 @@ pub fn rename_session(path: &Path, requested_name: &str) -> Result<String> {
                 character
             }
         })
-        .take(80)
+        .take(max_characters)
         .collect::<String>();
     let name = name.trim();
     anyhow::ensure!(!name.is_empty(), "session name cannot be empty");
-    let conn = Connection::open(path)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.execute(
-        "INSERT INTO metadata(key, value) VALUES ('name', ?1)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [name],
-    )?;
     Ok(name.to_owned())
+}
+
+fn open_existing(path: &Path) -> Result<Connection> {
+    Ok(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?)
+}
+
+pub fn delete_session(path: &Path) -> Result<()> {
+    // Validate the target before removing it so an unrelated file in the data
+    // directory cannot be silently deleted through this API.
+    read_session(path)?;
+    remove_sqlite_sidecars(path)?;
+    fs::remove_file(path)
+        .with_context(|| format!("failed to delete session {}", path.display()))?;
+    Ok(())
 }
 
 /// Delete a recording that contains no activity beyond leaving the shell.
@@ -213,7 +262,7 @@ pub fn discard_if_empty(path: &Path) -> Result<bool> {
 }
 
 fn remove_sqlite_sidecars(path: &Path) -> Result<()> {
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-shm", "-journal"] {
         let mut sidecar = path.as_os_str().to_owned();
         sidecar.push(suffix);
         let sidecar = PathBuf::from(sidecar);
@@ -273,11 +322,16 @@ pub fn read_session(path: &Path) -> Result<Session> {
         )
         .unwrap_or_default();
     let id = meta("id")?;
-    let name = conn
+    let stored_name = conn
         .query_row("SELECT value FROM metadata WHERE key = 'name'", [], |row| {
             row.get(0)
         })
         .unwrap_or_else(|_| id.clone());
+    let name = if stored_name.trim().is_empty() || stored_name == id {
+        UNTITLED_TITLE.to_owned()
+    } else {
+        stored_name
+    };
     Ok(Session {
         id,
         name,
@@ -461,11 +515,15 @@ mod tests {
             read_session(&path)?.summary,
             "Built the project.\nAll tests passed."
         );
-        assert_eq!(read_session(&path)?.name, "test");
+        assert_eq!(read_session(&path)?.name, UNTITLED_TITLE);
+        assert!(set_generated_title(&path, "Build and Test Project")?);
+        assert_eq!(read_session(&path)?.name, "Build and Test Project");
         assert_eq!(
             rename_session(&path, "  release investigation\nignored  ")?,
             "release investigation ignored"
         );
+        assert_eq!(read_session(&path)?.name, "release investigation ignored");
+        assert!(!set_generated_title(&path, "Late Generated Title")?);
         assert_eq!(read_session(&path)?.name, "release investigation ignored");
         let items = commands(&path)?;
         assert_eq!(command_output(&path, &items[0])?, b"one\r\n");
@@ -513,6 +571,27 @@ mod tests {
             b"Compiling dependency"
         );
 
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_database_and_sidecars() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("asciinematic-delete-test-{}", uuid::Uuid::new_v4()));
+        let path = create_session(&dir, "delete-me", "sh")?;
+        let wal = dir.join("delete-me-wal");
+        let shm = dir.join("delete-me-shm");
+        let journal = dir.join("delete-me-journal");
+        std::fs::write(&wal, b"stale")?;
+        std::fs::write(&shm, b"stale")?;
+        std::fs::write(&journal, b"stale")?;
+
+        delete_session(&path)?;
+        assert!(!path.exists());
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        assert!(!journal.exists());
         std::fs::remove_dir_all(dir)?;
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     env,
     io::{self, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context, Result};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use uuid::Uuid;
 
 use crate::{
     store::{self, INPUT, OUTPUT},
@@ -98,19 +99,26 @@ impl CommandTracker {
         let output = self.output.make_contiguous();
         let output_base = self.output_base;
         let mut confirmed = Vec::new();
-        self.pending.retain(|candidate| {
-            let start = candidate
-                .output_offset
-                .saturating_sub(output_base)
-                .min(output.len());
-            // Match against the rendered terminal state. Shell line editors redraw input
-            // with cursor controls, so looking for contiguous raw bytes can miss a command
-            // that was plainly visible before Enter was pressed.
-            let rendered = text::terminal_snapshot(&output[start..]);
-            let echoed = contains_bytes(rendered.as_bytes(), &candidate.needle);
-            let expired =
-                now_us.saturating_sub(candidate.submitted_us) > Self::CONFIRMATION_WINDOW_US;
+        while let Some(candidate) = self.pending.front() {
+            let (echoed, expired) = {
+                let start = candidate
+                    .output_offset
+                    .saturating_sub(output_base)
+                    .min(output.len());
+                let raw_output = &output[start..];
+                // Most shells echo a submitted built-in such as `cd` without producing
+                // any separate result output. Accept that raw PTY echo directly, while
+                // retaining the rendered-state match for line editors which redraw input.
+                let raw_echoed = contains_bytes(raw_output, &candidate.needle);
+                let rendered = text::terminal_snapshot(raw_output);
+                let rendered_echoed = contains_bytes(rendered.as_bytes(), &candidate.needle);
+                (
+                    raw_echoed || rendered_echoed,
+                    now_us.saturating_sub(candidate.submitted_us) > Self::CONFIRMATION_WINDOW_US,
+                )
+            };
             if echoed {
+                let candidate = self.pending.pop_front().expect("front checked above");
                 self.ordinal += 1;
                 confirmed.push(ConfirmedCommand {
                     ordinal: self.ordinal,
@@ -120,11 +128,19 @@ impl CommandTracker {
                     } else {
                         candidate.started_us
                     },
-                    raw: candidate.raw.clone(),
+                    raw: candidate.raw,
                 });
+                continue;
             }
-            !echoed && !expired
-        });
+            if expired {
+                self.pending.pop_front();
+                continue;
+            }
+            // Pasted lines must be confirmed in submission order. A later line may
+            // contain the same text as an earlier line, so confirming every matching
+            // candidate against one output chunk can reorder or duplicate history.
+            break;
+        }
         confirmed
     }
 
@@ -183,6 +199,31 @@ impl Drop for RawModeGuard {
 
 fn elapsed_us(start: Instant) -> i64 {
     start.elapsed().as_micros().min(i64::MAX as u128) as i64
+}
+
+pub fn record_new_session(data_dir: &Path, program: &Path) -> Result<(PathBuf, i32)> {
+    let id = Uuid::new_v4().simple().to_string();
+    let path = store::create_session(data_dir, &id, &program.to_string_lossy())?;
+
+    eprintln!("Recording {id}. Press Ctrl-T twice for controls; exit the shell to finish.\r");
+    match run(&path, program) {
+        Ok(code) => {
+            if store::discard_if_empty(&path)? {
+                eprintln!("\r\nEmpty recording discarded.");
+            } else {
+                eprintln!("\r\nSaved {}.", path.display());
+            }
+            Ok((path, code))
+        }
+        Err(error) => {
+            let duration_us = store::latest_event_time(&path).unwrap_or_default();
+            let _ = store::finish(&path, duration_us);
+            if matches!(store::discard_if_empty(&path), Ok(false)) {
+                let _ = summary::spawn_worker(&path);
+            }
+            Err(error)
+        }
+    }
 }
 
 pub fn run(path: &Path, program: &Path) -> Result<i32> {
@@ -506,6 +547,51 @@ mod tests {
         });
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].raw, b"cargo test");
+    }
+
+    #[test]
+    fn shell_builtin_is_confirmed_even_without_result_output() {
+        let mut tracker = CommandTracker::default();
+        let confirmed = tracker.submit(PendingCommand {
+            started_us: 10,
+            submitted_us: 100,
+            output_offset: tracker.output_offset(),
+            raw: b"cd /tmp".to_vec(),
+            needle: b"cd /tmp".to_vec(),
+            boundary_on_echo: false,
+        });
+        assert!(confirmed.is_empty());
+        let confirmed = tracker.observe_output(b"sh$ cd /tmp\r\nsh$ ", 110);
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].raw, b"cd /tmp");
+    }
+
+    #[test]
+    fn repeated_pasted_commands_are_confirmed_in_submission_order() {
+        let mut tracker = CommandTracker::default();
+        for raw in [b"pwd".as_slice(), b"cd /tmp", b"pwd"] {
+            let offset = tracker.output_offset();
+            assert!(
+                tracker
+                    .submit(PendingCommand {
+                        started_us: 10,
+                        submitted_us: 100,
+                        output_offset: offset,
+                        raw: raw.to_vec(),
+                        needle: raw.to_vec(),
+                        boundary_on_echo: false,
+                    })
+                    .is_empty()
+            );
+        }
+        let confirmed = tracker.observe_output(b"pwd\r\ncd /tmp\r\npwd\r\n", 110);
+        assert_eq!(
+            confirmed
+                .iter()
+                .map(|command| command.raw.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"pwd".as_slice(), b"cd /tmp".as_slice(), b"pwd".as_slice()]
+        );
     }
 
     #[test]

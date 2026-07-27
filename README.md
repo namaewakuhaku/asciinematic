@@ -50,8 +50,14 @@ The saved-session browser provides:
 - `r` to replay the complete selected session;
 - `e` to export its complete transcript and copy the path;
 - `n` to rename the selected session interactively;
+- `N` to leave the browser, start a new recording, and return when it finishes;
+- `d`, then `d` again, to permanently delete the selected saved session;
 - `c` to switch back to current-session controls when opened during recording;
 - `q` or `Esc` to return or quit.
+
+During any replay, use `Space` to pause or resume, `←`/`h` to jump back five
+seconds, `→`/`l`/`f` to jump forward five seconds, `Home`/`End` to seek to the
+beginning or end, and `q` or `Esc` to stop immediately.
 
 PTY output produced while either menu is visible remains timestamped and stored.
 It is buffered from the display and flushed when you return to the terminal.
@@ -66,16 +72,19 @@ Configuration is environment-only:
 On Linux, the default storage location is
 `~/.config/asciinematic/<session-uuid>`.
 
-Session filenames and IDs are complete random UUIDs. Their initial display names
-are those UUIDs, but display names can be changed from the session menu without
-renaming or destabilizing the underlying database file.
+Session filenames and IDs are complete random UUIDs. New sessions display as
+`Untitled` until the background agent generates a short title. The browser shows
+the full UUID and a readable UTC timestamp beneath each title. Display names can
+also be changed manually without renaming or destabilizing the database file. When
+the browser is opened from a live recording, a blinking green dot follows that
+session's UUID.
 
 Session files intentionally have no extension. They identify themselves through
 SQLite's file-format pragmas: `application_id = 0x41534349` (`ASCI`) and
 `user_version = 2`. Existing version-1, `.sqlite`, and `.sqlite3` sessions remain
 discoverable.
 
-## Automatic summaries
+## Automatic titles and summaries
 
 No model or inference runtime is embedded. When recording ends, asciinematic
 detaches a small background copy of itself and immediately returns control to the
@@ -85,11 +94,13 @@ user. The worker looks for authenticated `codex` and then `claude` executables o
 Codex runs with `exec --ephemeral`; Claude runs with
 `--print --no-session-persistence`. Both receive the transcript through standard
 input in a one-shot task with tools disabled or read-only isolation. Their output
-is reduced to 1–5 plain summary lines and stored in the session database.
+is reduced to a short human-readable title and 1–5 plain summary lines, then
+stored in the session database. A manual rename is never overwritten by a late
+background result.
 
 Every submitted command and its rendered output, including unfinished final
 output, is supplied. If neither agent is installed or authenticated, or both
-fail, the session remains usable and the bottom pane displays
+fail, the session remains usable as `Untitled` and the bottom pane displays
 `No summary available for this session.`
 
 Saving a selected command range creates another UUID-named session and generates
@@ -101,7 +112,7 @@ Every session database contains:
 
 - `events`: timestamped PTY output and confirmed command input stored as BLOBs;
 - `commands`: exact submitted keystrokes and timeline boundaries;
-- `metadata`: session UUID, summary, program, start time, and duration.
+- `metadata`: session UUID, title, summary, program, start time, and duration.
 
 Saved ranges are complete session databases, so they can be inspected and replayed
 from the same interactive browser. Text exports are written beside the databases,
@@ -114,8 +125,10 @@ completed recording consists of its single extensionless database file. Finishin
 an older WAL recording converts it and removes residual `-wal`/`-shm` sidecars.
 
 Input is forwarded to the PTY immediately. A submitted line is stored as soon as
-its rendered shell echo confirms it, before result output or command completion.
-Shell redraws and line-editor cursor controls are interpreted during confirmation;
+its raw or rendered shell echo confirms it, before result output or command
+completion. This includes shell built-ins such as `cd`, `export`, and `alias`, even
+when they produce no separate output. Shell redraws and line-editor cursor controls
+are interpreted during confirmation;
 unechoed password input and unrelated full-screen application interaction are
 neither indexed nor persisted. Confirmed commands retain their exact raw
 keystrokes.
@@ -130,8 +143,9 @@ Previews, exports, and summary context are rendered through a bounded 120×40 vi
 terminal with 256 lines of scrollback. Cursor movement, erasure, progress updates, and
 full-screen redraws are applied before text is shown or written, so interactive programs
 look like terminal snapshots instead of a flood of intermediate frames. Replay still uses
-the original byte-accurate event timeline.
+the original byte-accurate event timeline. Text exports place a visible separator between
+command steps.
 
-Command boundaries are inferred from rendered shell echoes around Enter
+Command boundaries are inferred from raw or rendered shell echoes around Enter
 submissions. Unusual shells which never display entered commands may not produce
 command items, but their output history is still recorded.

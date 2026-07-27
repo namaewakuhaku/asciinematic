@@ -1,9 +1,8 @@
 use std::{
-    fs,
+    env, fs,
     io::{self, Write},
-    path::Path,
-    thread,
-    time::Duration,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -25,7 +24,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear as RatatuiClear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::{store, summary, text};
+use crate::{record, store, summary, text};
 use uuid::Uuid;
 
 const BACKGROUND: Color = Color::Rgb(10, 14, 22);
@@ -37,6 +36,9 @@ const SECONDARY: Color = Color::Rgb(216, 180, 254);
 const SUCCESS: Color = Color::Rgb(134, 239, 172);
 const WARNING: Color = Color::Rgb(253, 224, 71);
 const SELECTED: Color = Color::Rgb(30, 64, 175);
+const REPLAY_SEEK_US: i64 = 5_000_000;
+const EXPORT_STEP_SEPARATOR: &str =
+    "────────────────────────────────────────────────────────────────────────";
 
 fn base_style() -> Style {
     Style::default().fg(FOREGROUND).bg(BACKGROUND)
@@ -89,10 +91,26 @@ impl Drop for RawModeGuard {
 }
 
 pub fn sessions_menu(data_dir: &Path) -> Result<()> {
-    let _raw_mode = RawModeGuard::enter()?;
-    let _screen = TerminalGuard::enter_preserving_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    browse_sessions(&mut terminal, data_dir, false)
+    loop {
+        let action = {
+            let _raw_mode = RawModeGuard::enter()?;
+            let _screen = TerminalGuard::enter_preserving_raw_mode()?;
+            let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+            browse_sessions(&mut terminal, data_dir, false, None)?
+        };
+        match action {
+            BrowserExit::Close => return Ok(()),
+            BrowserExit::NewSession => {
+                let shell = env::var_os("SHELL")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+                let (_, code) = record::record_new_session(data_dir, &shell)?;
+                if code != 0 {
+                    eprintln!("Shell exited with status {code}.");
+                }
+            }
+        }
+    }
 }
 
 pub fn control_panel(path: &Path, data_dir: &Path) -> Result<()> {
@@ -239,9 +257,9 @@ fn session_control_panel(
                 Paragraph::new(vec![
                     Line::raw("Space range anchor  a all  x clear  w checkpoint  s save range"),
                     Line::raw(if is_live {
-                        "r replay command  e export range  b saved sessions  ↑/↓ select  q resume"
+                        "r replay*  e export  b sessions  ↑/↓ select  q resume  *Space/←/→/q"
                     } else {
-                        "r replay command  e export range  b/q session list  ↑/↓ select"
+                        "r replay*  e export  b/q sessions  ↑/↓ select  *Space/←/→/q"
                     }),
                 ])
                 .style(Style::default().fg(FOREGROUND).bg(PANEL))
@@ -317,7 +335,7 @@ fn session_control_panel(
             }
             KeyCode::Char('b') => {
                 if is_live {
-                    browse_sessions(terminal, data_dir, true)?;
+                    let _ = browse_sessions(terminal, data_dir, true, Some(path))?;
                     session = store::read_session(path)?;
                     status = "Returned to current-session controls".to_owned();
                 } else {
@@ -330,17 +348,25 @@ fn session_control_panel(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum BrowserExit {
+    Close,
+    NewSession,
+}
+
 fn browse_sessions(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     data_dir: &Path,
     can_return_to_current: bool,
-) -> Result<()> {
+    protected_session: Option<&Path>,
+) -> Result<BrowserExit> {
     let mut session_index = 0_usize;
     let mut scroll = 0_u16;
     let mut status = "Select a session to inspect its complete transcript".to_owned();
     let mut rename_buffer = None::<String>;
+    let mut delete_confirmation = None::<std::path::PathBuf>;
 
-    loop {
+    let action = loop {
         let sessions = store::list_sessions(data_dir)?;
         session_index = session_index.min(sessions.len().saturating_sub(1));
         let selected_session = sessions.get(session_index);
@@ -390,13 +416,36 @@ fn browse_sessions(
             let session_items = sessions
                 .iter()
                 .map(|session| {
-                    ListItem::new(format!(
-                        "{}\n  {}  {:>8}  {} command(s)",
-                        session.name,
-                        &session.id[..session.id.len().min(8)],
-                        format_duration(session.duration_us),
-                        session.command_count
-                    ))
+                    let is_live =
+                        protected_session.is_some_and(|path| path == session.path.as_path());
+                    let mut uuid_spans = vec![Span::styled(
+                        format!("  {}", session.id),
+                        Style::default().fg(BORDER),
+                    )];
+                    if is_live {
+                        uuid_spans.push(Span::styled(
+                            " ●",
+                            Style::default()
+                                .fg(SUCCESS)
+                                .add_modifier(Modifier::BOLD | Modifier::SLOW_BLINK),
+                        ));
+                    }
+                    ListItem::new(Text::from(vec![
+                        Line::styled(
+                            session.name.as_str(),
+                            Style::default().fg(FOREGROUND).add_modifier(Modifier::BOLD),
+                        ),
+                        Line::from(uuid_spans),
+                        Line::styled(
+                            format!(
+                                "  {} · {} · {} cmd",
+                                format_timestamp(session.started_at),
+                                format_duration(session.duration_us),
+                                session.command_count
+                            ),
+                            Style::default().fg(BORDER),
+                        ),
+                    ]))
                 })
                 .collect::<Vec<_>>();
             let mut session_state =
@@ -433,11 +482,15 @@ fn browse_sessions(
             );
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::raw("↑/↓ session  Enter inspect/actions  PgUp/PgDn transcript  n rename"),
                     Line::raw(if can_return_to_current {
-                        "r replay session  e export session  c current-session controls  q back"
+                        "↑/↓ session  Enter inspect  PgUp/PgDn transcript  n rename"
                     } else {
-                        "r replay session  e export session  q quit"
+                        "↑/↓ session  Enter inspect  PgUp/PgDn transcript  n rename  N new"
+                    }),
+                    Line::raw(if can_return_to_current {
+                        "r replay*  e export  d delete  c current  q back  *Space/←/→/q"
+                    } else {
+                        "r replay*  e export  d delete  q quit  *Space/←/→/q"
                     }),
                 ])
                 .style(Style::default().fg(FOREGROUND).bg(PANEL))
@@ -470,6 +523,32 @@ fn browse_sessions(
                     ])
                     .style(Style::default().fg(FOREGROUND).bg(PANEL))
                     .block(panel(" Rename ")),
+                    popup,
+                );
+            }
+
+            if let Some(path) = delete_confirmation.as_deref() {
+                let popup = confirmation_popup(frame.area());
+                let name = sessions
+                    .iter()
+                    .find(|session| session.path == path)
+                    .map_or("selected session", |session| session.name.as_str());
+                frame.render_widget(RatatuiClear, popup);
+                frame.render_widget(
+                    Paragraph::new(vec![
+                        Line::styled(
+                            "Permanently delete session?",
+                            Style::default().fg(WARNING).add_modifier(Modifier::BOLD),
+                        ),
+                        Line::raw(name),
+                        Line::raw(""),
+                        Line::styled(
+                            "Press d again to delete · Esc to cancel",
+                            Style::default().fg(BORDER),
+                        ),
+                    ])
+                    .style(Style::default().fg(FOREGROUND).bg(PANEL))
+                    .block(panel(" Confirm deletion ")),
                     popup,
                 );
             }
@@ -512,9 +591,37 @@ fn browse_sessions(
             continue;
         }
 
+        if let Some(path) = delete_confirmation.clone() {
+            match key.code {
+                KeyCode::Char('d') => {
+                    let name = sessions
+                        .iter()
+                        .find(|session| session.path == path)
+                        .map_or_else(
+                            || path.display().to_string(),
+                            |session| session.name.clone(),
+                        );
+                    match store::delete_session(&path) {
+                        Ok(()) => {
+                            status = format!("Deleted session {name}");
+                            scroll = 0;
+                        }
+                        Err(error) => status = format!("Delete failed: {error}"),
+                    }
+                    delete_confirmation = None;
+                }
+                KeyCode::Esc => {
+                    delete_confirmation = None;
+                    status = "Deletion cancelled".to_owned();
+                }
+                _ => {}
+            }
+            continue;
+        }
+
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('c') if can_return_to_current => break,
+            KeyCode::Char('q') | KeyCode::Esc => break BrowserExit::Close,
+            KeyCode::Char('c') if can_return_to_current => break BrowserExit::Close,
             KeyCode::Up | KeyCode::Char('k') => {
                 session_index = session_index.saturating_sub(1);
                 scroll = 0;
@@ -552,16 +659,44 @@ fn browse_sessions(
                 rename_buffer = Some(String::new());
                 status = "Editing session name".to_owned();
             }
+            KeyCode::Char('d') => {
+                if let Some(session) = selected_session {
+                    if protected_session.is_some_and(|path| path == session.path) {
+                        status = "The active recording cannot be deleted".to_owned();
+                    } else {
+                        delete_confirmation = Some(session.path.clone());
+                        status = format!("Confirm deletion of {}", session.name);
+                    }
+                }
+            }
+            KeyCode::Char('N') => {
+                if protected_session.is_some() {
+                    status = "Finish the active recording before starting another".to_owned();
+                } else {
+                    break BrowserExit::NewSession;
+                }
+            }
             _ => {}
         }
-    }
+    };
     terminal.clear()?;
-    Ok(())
+    Ok(action)
 }
 
 fn rename_popup(area: Rect) -> Rect {
     let width = area.width.saturating_sub(4).min(72);
     let height = 6.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn confirmation_popup(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(4).min(64);
+    let height = 8.min(area.height);
     Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -589,22 +724,122 @@ fn replay_events(
 ) -> Result<()> {
     terminal.clear()?;
     execute!(io::stdout(), MoveTo(0, 0), CrosstermClear(ClearType::All))?;
-    let mut previous_us = events.first().map(|event| event.0).unwrap_or_default();
-    let mut stdout = io::stdout().lock();
-    for (time_us, bytes) in events {
-        let delay = time_us.saturating_sub(previous_us);
-        if delay > 0 {
-            thread::sleep(Duration::from_micros(delay as u64));
-        }
-        stdout.write_all(&bytes)?;
+    if events.is_empty() {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(b"[replay has no output - press any key to return]\r\n")?;
         stdout.flush()?;
-        previous_us = time_us;
+        drop(stdout);
+        let _ = event::read()?;
+        terminal.clear()?;
+        return Ok(());
     }
-    stdout.write_all(b"\r\n\r\n[replay finished - press any key to return]\r\n")?;
-    stdout.flush()?;
+
+    let start_us = events.first().map(|event| event.0).unwrap_or_default();
+    let end_us = events.last().map(|event| event.0).unwrap_or(start_us);
+    let mut position_us = start_us;
+    let mut event_index = 0;
+    let mut paused = false;
+    let mut last_tick = Instant::now();
+    let mut stopped = false;
+    let mut stdout = io::stdout().lock();
+
+    loop {
+        let now = Instant::now();
+        if !paused {
+            let elapsed_us = now
+                .duration_since(last_tick)
+                .as_micros()
+                .min(i64::MAX as u128) as i64;
+            position_us = position_us.saturating_add(elapsed_us).min(end_us);
+        }
+        last_tick = now;
+        write_replay_until(&events, &mut event_index, position_us, &mut stdout)?;
+        stdout.flush()?;
+
+        if event_index >= events.len() {
+            break;
+        }
+        if !event::poll(Duration::from_millis(25))? {
+            continue;
+        }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                stopped = true;
+                break;
+            }
+            KeyCode::Char(' ') => {
+                paused = !paused;
+                last_tick = Instant::now();
+            }
+            KeyCode::Right | KeyCode::Char('l' | 'f') => {
+                position_us = seek_replay(position_us, start_us, end_us, REPLAY_SEEK_US);
+                last_tick = Instant::now();
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                position_us = seek_replay(position_us, start_us, end_us, -REPLAY_SEEK_US);
+                redraw_replay(&events, &mut event_index, position_us, &mut stdout)?;
+                last_tick = Instant::now();
+            }
+            KeyCode::Home => {
+                position_us = start_us;
+                redraw_replay(&events, &mut event_index, position_us, &mut stdout)?;
+                last_tick = Instant::now();
+            }
+            KeyCode::End => {
+                position_us = end_us;
+                last_tick = Instant::now();
+            }
+            _ => {}
+        }
+    }
+    if !stopped {
+        stdout.write_all(b"\r\n\r\n[replay finished - press any key to return]\r\n")?;
+        stdout.flush()?;
+    }
     drop(stdout);
-    let _ = event::read()?;
+    if !stopped {
+        let _ = event::read()?;
+    }
     terminal.clear()?;
+    Ok(())
+}
+
+fn seek_replay(position_us: i64, start_us: i64, end_us: i64, delta_us: i64) -> i64 {
+    position_us.saturating_add(delta_us).clamp(start_us, end_us)
+}
+
+fn write_replay_until(
+    events: &[(i64, Vec<u8>)],
+    event_index: &mut usize,
+    position_us: i64,
+    output: &mut impl Write,
+) -> Result<()> {
+    while let Some((time_us, bytes)) = events.get(*event_index) {
+        if *time_us > position_us {
+            break;
+        }
+        output.write_all(bytes)?;
+        *event_index += 1;
+    }
+    Ok(())
+}
+
+fn redraw_replay(
+    events: &[(i64, Vec<u8>)],
+    event_index: &mut usize,
+    position_us: i64,
+    output: &mut impl Write,
+) -> Result<()> {
+    execute!(output, MoveTo(0, 0), CrosstermClear(ClearType::All))?;
+    *event_index = 0;
+    write_replay_until(events, event_index, position_us, output)?;
+    output.flush()?;
     Ok(())
 }
 
@@ -624,7 +859,10 @@ fn render_commands_text(path: &Path, commands: &[store::CommandItem]) -> Result<
         return Ok("No commands recorded.\n".to_owned());
     }
     let mut transcript = Vec::new();
-    for item in commands {
+    for (index, item) in commands.iter().enumerate() {
+        if index > 0 {
+            writeln!(transcript, "{EXPORT_STEP_SEPARATOR}\n")?;
+        }
         writeln!(transcript, "$ {}", text::display_input(&item.input))?;
         let snapshot = text::terminal_snapshot(&store::command_output(path, item)?);
         writeln!(transcript, "{snapshot}\n")?;
@@ -676,9 +914,37 @@ pub fn format_duration(microseconds: i64) -> String {
     }
 }
 
+fn format_timestamp(unix_seconds: i64) -> String {
+    let days = unix_seconds.div_euclid(86_400);
+    let seconds_of_day = unix_seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_date_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = seconds_of_day % 3_600 / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{encode_base64, osc52_sequence};
+    use super::{
+        encode_base64, format_timestamp, osc52_sequence, render_commands_text, seek_replay,
+    };
+    use crate::store::{self, OUTPUT};
+    use anyhow::Result;
 
     #[test]
     fn clipboard_sequence_contains_base64_path() {
@@ -687,5 +953,40 @@ mod tests {
             osc52_sequence("/tmp/a.txt"),
             "\u{1b}]52;c;L3RtcC9hLnR4dA==\u{7}"
         );
+    }
+
+    #[test]
+    fn replay_seek_is_clamped_to_the_recording() {
+        assert_eq!(seek_replay(10, 10, 100, -50), 10);
+        assert_eq!(seek_replay(50, 10, 100, 25), 75);
+        assert_eq!(seek_replay(90, 10, 100, 50), 100);
+    }
+
+    #[test]
+    fn session_timestamp_is_human_readable_utc() {
+        assert_eq!(format_timestamp(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_timestamp(1_704_110_400), "2024-01-01 12:00 UTC");
+    }
+
+    #[test]
+    fn text_export_separates_command_steps() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("asciinematic-export-test-{}", uuid::Uuid::new_v4()));
+        let path = store::create_session(&dir, "test", "sh")?;
+        let conn = store::open_event_writer(&path)?;
+        store::add_command(&conn, 1, 10, b"cd /tmp")?;
+        store::append_event(&conn, 11, OUTPUT, b"sh$ ")?;
+        store::add_command(&conn, 2, 20, b"pwd")?;
+        store::append_event(&conn, 21, OUTPUT, b"/tmp\r\n")?;
+        drop(conn);
+        store::finish(&path, 30)?;
+
+        let transcript = render_commands_text(&path, &store::commands(&path)?)?;
+        assert!(transcript.contains("$ cd /tmp"));
+        assert!(transcript.contains(
+            "\n────────────────────────────────────────────────────────────────────────\n\n$ pwd"
+        ));
+        std::fs::remove_dir_all(dir)?;
+        Ok(())
     }
 }

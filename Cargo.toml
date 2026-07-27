@@ -1,0 +1,15 @@
+[package]
+name = "asciinematic"
+version = "0.1.0"
+edition = "2024"
+description = "A command-aware terminal session recorder"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.28"
+directories = "6.0"
+portable-pty = "0.9"
+ratatui = "0.29"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1.11", features = ["v4"] }

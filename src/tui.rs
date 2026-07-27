@@ -8,7 +8,10 @@ use std::{
 use anyhow::Result;
 use crossterm::{
     cursor::MoveTo,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseButton, MouseEventKind,
+    },
     execute,
     terminal::{
         Clear as CrosstermClear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
@@ -64,14 +67,14 @@ struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter_preserving_raw_mode() -> Result<Self> {
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(Self)
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -130,6 +133,9 @@ fn session_control_panel(
     let mut selected = commands.len().saturating_sub(1);
     let mut anchor = None;
     let mut scroll = 0_u16;
+    let mut command_list_area = Rect::default();
+    let mut command_list_offset = 0_usize;
+    let mut preview_area = Rect::default();
     let mut status = if is_live {
         format!("Recording is live at {}", path.display())
     } else {
@@ -188,6 +194,8 @@ fn session_control_panel(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
                 .split(outer[1]);
+            command_list_area = columns[0];
+            preview_area = columns[1];
             let items = commands
                 .iter()
                 .enumerate()
@@ -214,6 +222,7 @@ fn session_control_panel(
             let mut list_state =
                 ListState::default().with_selected((!commands.is_empty()).then_some(selected));
             frame.render_stateful_widget(list, columns[0], &mut list_state);
+            command_list_offset = list_state.offset();
 
             let detail = commands.get(selected).map_or_else(
                 || Text::from("No commands have been submitted yet."),
@@ -272,7 +281,43 @@ fn session_control_panel(
             );
         })?;
 
-        let Event::Key(key) = event::read()? else {
+        let input_event = event::read()?;
+        if let Event::Mouse(mouse) = &input_event {
+            if rect_contains(command_list_area, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        selected = selected.saturating_sub(3);
+                        scroll = 0;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        selected = (selected + 3).min(commands.len().saturating_sub(1));
+                        scroll = 0;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(index) = list_index_at(
+                            command_list_area,
+                            mouse.column,
+                            mouse.row,
+                            command_list_offset,
+                            1,
+                            commands.len(),
+                        ) {
+                            selected = index;
+                            scroll = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            } else if rect_contains(preview_area, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => scroll = scroll.saturating_add(3),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let Event::Key(key) = input_event else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -365,6 +410,9 @@ fn browse_sessions(
     let mut status = "Select a session to inspect its complete transcript".to_owned();
     let mut rename_buffer = None::<String>;
     let mut delete_confirmation = None::<std::path::PathBuf>;
+    let mut session_list_area = Rect::default();
+    let mut session_list_offset = 0_usize;
+    let mut transcript_area = Rect::default();
 
     let action = loop {
         let sessions = store::list_sessions(data_dir)?;
@@ -413,6 +461,8 @@ fn browse_sessions(
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
                 .split(outer[1]);
+            session_list_area = columns[0];
+            transcript_area = columns[1];
             let session_items = sessions
                 .iter()
                 .map(|session| {
@@ -458,6 +508,7 @@ fn browse_sessions(
                 columns[0],
                 &mut session_state,
             );
+            session_list_offset = session_state.offset();
 
             frame.render_widget(
                 Paragraph::new(transcript.as_str())
@@ -554,7 +605,46 @@ fn browse_sessions(
             }
         })?;
 
-        let Event::Key(key) = event::read()? else {
+        let input_event = event::read()?;
+        if rename_buffer.is_none()
+            && delete_confirmation.is_none()
+            && let Event::Mouse(mouse) = &input_event
+        {
+            if rect_contains(session_list_area, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        session_index = session_index.saturating_sub(1);
+                        scroll = 0;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        session_index = (session_index + 1).min(sessions.len().saturating_sub(1));
+                        scroll = 0;
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(index) = list_index_at(
+                            session_list_area,
+                            mouse.column,
+                            mouse.row,
+                            session_list_offset,
+                            3,
+                            sessions.len(),
+                        ) {
+                            session_index = index;
+                            scroll = 0;
+                        }
+                    }
+                    _ => {}
+                }
+            } else if rect_contains(transcript_area, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(3),
+                    MouseEventKind::ScrollDown => scroll = scroll.saturating_add(3),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        let Event::Key(key) = input_event else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
@@ -703,6 +793,36 @@ fn confirmation_popup(area: Rect) -> Rect {
         width,
         height,
     }
+}
+
+fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
+fn list_index_at(
+    area: Rect,
+    column: u16,
+    row: u16,
+    offset: usize,
+    item_height: u16,
+    item_count: usize,
+) -> Option<usize> {
+    if area.width < 3
+        || area.height < 3
+        || item_height == 0
+        || column <= area.x
+        || column >= area.x.saturating_add(area.width).saturating_sub(1)
+        || row <= area.y
+        || row >= area.y.saturating_add(area.height).saturating_sub(1)
+    {
+        return None;
+    }
+    let visible_row = row.saturating_sub(area.y).saturating_sub(1);
+    let index = offset.saturating_add((visible_row / item_height) as usize);
+    (index < item_count).then_some(index)
 }
 
 fn selected_range(selected: usize, anchor: Option<usize>) -> (usize, usize) {
@@ -863,11 +983,22 @@ fn render_commands_text(path: &Path, commands: &[store::CommandItem]) -> Result<
         if index > 0 {
             writeln!(transcript, "{EXPORT_STEP_SEPARATOR}\n")?;
         }
-        writeln!(transcript, "$ {}", text::display_input(&item.input))?;
+        let input = text::display_input(&item.input);
+        writeln!(transcript, "$ {input}")?;
         let snapshot = text::terminal_snapshot(&store::command_output(path, item)?);
+        let snapshot = clean_export_snapshot(&snapshot, &input);
         writeln!(transcript, "{snapshot}\n")?;
     }
     Ok(String::from_utf8(transcript).expect("transcript formatter only writes UTF-8"))
+}
+
+fn clean_export_snapshot(snapshot: &str, input: &str) -> String {
+    let lines = snapshot.lines().collect::<Vec<_>>();
+    let first_output = lines
+        .iter()
+        .position(|line| line.trim() != input)
+        .unwrap_or(lines.len());
+    lines[first_output..].join("\n").trim_end().to_owned()
 }
 
 fn copy_path_to_clipboard(path: &Path) -> Result<()> {
@@ -941,10 +1072,12 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_base64, format_timestamp, osc52_sequence, render_commands_text, seek_replay,
+        clean_export_snapshot, encode_base64, format_timestamp, list_index_at, osc52_sequence,
+        render_commands_text, seek_replay,
     };
     use crate::store::{self, OUTPUT};
     use anyhow::Result;
+    use ratatui::layout::Rect;
 
     #[test]
     fn clipboard_sequence_contains_base64_path() {
@@ -966,6 +1099,24 @@ mod tests {
     fn session_timestamp_is_human_readable_utc() {
         assert_eq!(format_timestamp(0), "1970-01-01 00:00 UTC");
         assert_eq!(format_timestamp(1_704_110_400), "2024-01-01 12:00 UTC");
+    }
+
+    #[test]
+    fn text_export_removes_leading_command_echoes() {
+        assert_eq!(
+            clean_export_snapshot("ls\ncompose.yml\nshell$ ", "ls"),
+            "compose.yml\nshell$"
+        );
+        assert_eq!(clean_export_snapshot("exit\nexit", "exit"), "");
+    }
+
+    #[test]
+    fn mouse_rows_map_to_visible_list_items() {
+        let area = Rect::new(10, 5, 30, 14);
+        assert_eq!(list_index_at(area, 12, 6, 4, 3, 20), Some(4));
+        assert_eq!(list_index_at(area, 12, 9, 4, 3, 20), Some(5));
+        assert_eq!(list_index_at(area, 10, 6, 4, 3, 20), None);
+        assert_eq!(list_index_at(area, 12, 18, 4, 3, 5), None);
     }
 
     #[test]

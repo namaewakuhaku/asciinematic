@@ -55,6 +55,10 @@ The saved-session browser provides:
 - `c` to switch back to current-session controls when opened during recording;
 - `q` or `Esc` to return or quit.
 
+Mouse input is enabled while either menu is open. Use the wheel over a left-hand
+list to change its selected command or session, click an item to select it, and
+use the wheel over a right-hand preview or transcript to scroll its contents.
+
 During any replay, use `Space` to pause or resume, `←`/`h` to jump back five
 seconds, `→`/`l`/`f` to jump forward five seconds, `Home`/`End` to seek to the
 beginning or end, and `q` or `Esc` to stop immediately.

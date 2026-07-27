@@ -34,6 +34,7 @@ struct PendingCommand {
     raw: Vec<u8>,
     needle: Vec<u8>,
     boundary_on_echo: bool,
+    trusted_shell_input: bool,
 }
 
 struct ConfirmedCommand {
@@ -80,6 +81,16 @@ impl CommandTracker {
             .pending
             .iter()
             .any(|candidate| candidate.submitted_us == command.submitted_us);
+        if command.trusted_shell_input && !command.boundary_on_echo {
+            self.ordinal += 1;
+            confirmed.push(ConfirmedCommand {
+                ordinal: self.ordinal,
+                input_us: command.started_us,
+                started_us: command.started_us,
+                raw: command.raw,
+            });
+            return confirmed;
+        }
         self.pending.push_back(command);
         confirmed.extend(self.confirm(self.pending.back().map_or(0, |item| item.submitted_us)));
         confirmed
@@ -244,6 +255,9 @@ pub fn run(path: &Path, program: &Path) -> Result<i32> {
         .slave
         .spawn_command(command)
         .with_context(|| format!("failed to launch {}", program.display()))?;
+    let shell_process_id = child.process_id();
+    #[cfg(unix)]
+    let pty_fd = pair.master.as_raw_fd();
     drop(pair.slave);
 
     let mut reader = pair.master.try_clone_reader()?;
@@ -393,6 +407,12 @@ pub fn run(path: &Path, program: &Path) -> Result<i32> {
                                         raw: command_bytes.clone(),
                                         needle,
                                         boundary_on_echo: false,
+                                        trusted_shell_input: interactive
+                                            && shell_input_is_visible(
+                                                #[cfg(unix)]
+                                                pty_fd,
+                                                shell_process_id,
+                                            ),
                                     });
                                 persist_confirmed(&conn, confirmed)?;
                             }
@@ -499,6 +519,26 @@ fn forward_input(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn shell_input_is_visible(pty_fd: Option<i32>, shell_process_id: Option<u32>) -> bool {
+    let (Some(pty_fd), Some(shell_process_id)) = (pty_fd, shell_process_id) else {
+        return false;
+    };
+    // SAFETY: `pty_fd` belongs to the live PTY master for the duration of the
+    // recording. Both calls only query kernel-maintained terminal state.
+    unsafe {
+        let mut attributes = std::mem::zeroed::<libc::termios>();
+        libc::tcgetattr(pty_fd, &mut attributes) == 0
+            && attributes.c_lflag & libc::ECHO != 0
+            && libc::tcgetpgrp(pty_fd) == shell_process_id as libc::pid_t
+    }
+}
+
+#[cfg(not(unix))]
+fn shell_input_is_visible(_shell_process_id: Option<u32>) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CommandTracker, PendingCommand};
@@ -523,6 +563,7 @@ mod tests {
             raw: b"echo safe".to_vec(),
             needle: b"echo safe".to_vec(),
             boundary_on_echo: false,
+            trusted_shell_input: false,
         });
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].raw, b"echo safe");
@@ -544,6 +585,7 @@ mod tests {
             raw: b"cargo test".to_vec(),
             needle: b"cargo test".to_vec(),
             boundary_on_echo: false,
+            trusted_shell_input: false,
         });
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].raw, b"cargo test");
@@ -559,6 +601,7 @@ mod tests {
             raw: b"cd /tmp".to_vec(),
             needle: b"cd /tmp".to_vec(),
             boundary_on_echo: false,
+            trusted_shell_input: false,
         });
         assert!(confirmed.is_empty());
         let confirmed = tracker.observe_output(b"sh$ cd /tmp\r\nsh$ ", 110);
@@ -580,6 +623,7 @@ mod tests {
                         raw: raw.to_vec(),
                         needle: raw.to_vec(),
                         boundary_on_echo: false,
+                        trusted_shell_input: false,
                     })
                     .is_empty()
             );
@@ -608,6 +652,7 @@ mod tests {
                         raw: raw.to_vec(),
                         needle: raw.to_vec(),
                         boundary_on_echo: false,
+                        trusted_shell_input: false,
                     })
                     .is_empty()
             );
@@ -641,6 +686,7 @@ mod tests {
                     raw: b"secret".to_vec(),
                     needle: b"secret".to_vec(),
                     boundary_on_echo: false,
+                    trusted_shell_input: false,
                 })
                 .is_empty()
         );
@@ -649,5 +695,21 @@ mod tests {
         // contains the same bytes, the secret can no longer be confirmed or persisted.
         assert!(tracker.begin_line(200).is_empty());
         assert!(tracker.observe_output(b"secret\r\n", 250).is_empty());
+    }
+
+    #[test]
+    fn visible_shell_input_is_indexed_without_waiting_for_echo_tracking() {
+        let mut tracker = CommandTracker::default();
+        let confirmed = tracker.submit(PendingCommand {
+            started_us: 10,
+            submitted_us: 100,
+            output_offset: tracker.output_offset(),
+            raw: b"cd Services/postgres/".to_vec(),
+            needle: b"cd Services/postgres/".to_vec(),
+            boundary_on_echo: false,
+            trusted_shell_input: true,
+        });
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0].raw, b"cd Services/postgres/");
     }
 }

@@ -39,6 +39,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "directories",
+ "libc",
  "portable-pty",
  "ratatui",
  "rusqlite",

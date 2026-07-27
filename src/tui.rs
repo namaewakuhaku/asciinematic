@@ -149,6 +149,26 @@ fn session_control_panel(
             .map(|item| store::command_output(path, item))
             .transpose()?
             .unwrap_or_default();
+        let detail = commands.get(selected).map_or_else(
+            || Text::from("No commands have been submitted yet."),
+            |item| {
+                let snapshot = text::terminal_snapshot(&output);
+                let mut lines = vec![
+                    Line::styled(
+                        format!("COMMAND {}", item.ordinal),
+                        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(text::display_input(&item.input)),
+                    Line::raw(""),
+                    Line::styled(
+                        format!("SNAPSHOT ({} recorded bytes)", output.len()),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                ];
+                lines.extend(snapshot.lines().map(|line| Line::raw(line.to_owned())));
+                Text::from(lines)
+            },
+        );
         terminal.draw(|frame| {
             frame.render_widget(Block::default().style(base_style()), frame.area());
             let outer = Layout::default()
@@ -224,26 +244,8 @@ fn session_control_panel(
             frame.render_stateful_widget(list, columns[0], &mut list_state);
             command_list_offset = list_state.offset();
 
-            let detail = commands.get(selected).map_or_else(
-                || Text::from("No commands have been submitted yet."),
-                |item| {
-                    Text::from(vec![
-                        Line::styled(
-                            format!("COMMAND {}", item.ordinal),
-                            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
-                        ),
-                        Line::raw(text::display_input(&item.input)),
-                        Line::raw(""),
-                        Line::styled(
-                            format!("SNAPSHOT ({} recorded bytes)", output.len()),
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        Line::raw(text::terminal_snapshot(&output)),
-                    ])
-                },
-            );
             frame.render_widget(
-                Paragraph::new(detail)
+                Paragraph::new(detail.clone())
                     .style(Style::default().fg(FOREGROUND).bg(PANEL))
                     .block(panel(" Preview "))
                     .wrap(Wrap { trim: false })
@@ -280,6 +282,11 @@ fn session_control_panel(
                 outer[3],
             );
         })?;
+        let preview_scroll_limit = max_text_scroll(&detail, preview_area);
+        if scroll > preview_scroll_limit {
+            scroll = preview_scroll_limit;
+            continue;
+        }
 
         let input_event = event::read()?;
         if let Event::Mouse(mouse) = &input_event {
@@ -311,7 +318,9 @@ fn session_control_panel(
             } else if rect_contains(preview_area, mouse.column, mouse.row) {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(3),
-                    MouseEventKind::ScrollDown => scroll = scroll.saturating_add(3),
+                    MouseEventKind::ScrollDown => {
+                        scroll = scroll.saturating_add(3).min(preview_scroll_limit);
+                    }
                     _ => {}
                 }
             }
@@ -335,7 +344,9 @@ fn session_control_panel(
                 scroll = 0;
             }
             KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-            KeyCode::PageDown => scroll = scroll.saturating_add(10),
+            KeyCode::PageDown => {
+                scroll = scroll.saturating_add(10).min(preview_scroll_limit);
+            }
             KeyCode::Char(' ') if !commands.is_empty() => {
                 anchor = if anchor == Some(selected) {
                     None
@@ -426,6 +437,7 @@ fn browse_sessions(
             .map(|session| render_commands_text(&session.path, &commands))
             .transpose()?
             .unwrap_or_else(|| "No session selected.".to_owned());
+        let transcript_text = Text::raw(transcript.as_str());
 
         terminal.draw(|frame| {
             frame.render_widget(Block::default().style(base_style()), frame.area());
@@ -511,7 +523,7 @@ fn browse_sessions(
             session_list_offset = session_state.offset();
 
             frame.render_widget(
-                Paragraph::new(transcript.as_str())
+                Paragraph::new(transcript_text.clone())
                     .style(Style::default().fg(FOREGROUND).bg(PANEL))
                     .block(panel(" Full transcript "))
                     .wrap(Wrap { trim: false })
@@ -604,6 +616,11 @@ fn browse_sessions(
                 );
             }
         })?;
+        let transcript_scroll_limit = max_text_scroll(&transcript_text, transcript_area);
+        if scroll > transcript_scroll_limit {
+            scroll = transcript_scroll_limit;
+            continue;
+        }
 
         let input_event = event::read()?;
         if rename_buffer.is_none()
@@ -638,7 +655,9 @@ fn browse_sessions(
             } else if rect_contains(transcript_area, mouse.column, mouse.row) {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => scroll = scroll.saturating_sub(3),
-                    MouseEventKind::ScrollDown => scroll = scroll.saturating_add(3),
+                    MouseEventKind::ScrollDown => {
+                        scroll = scroll.saturating_add(3).min(transcript_scroll_limit);
+                    }
                     _ => {}
                 }
             }
@@ -721,7 +740,9 @@ fn browse_sessions(
                 scroll = 0;
             }
             KeyCode::PageUp => scroll = scroll.saturating_sub(10),
-            KeyCode::PageDown => scroll = scroll.saturating_add(10),
+            KeyCode::PageDown => {
+                scroll = scroll.saturating_add(10).min(transcript_scroll_limit);
+            }
             KeyCode::Enter => {
                 if let Some(session) = selected_session {
                     session_control_panel(terminal, &session.path, data_dir, false)?;
@@ -800,6 +821,20 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
         && column < area.x.saturating_add(area.width)
         && row >= area.y
         && row < area.y.saturating_add(area.height)
+}
+
+fn max_text_scroll(text: &Text<'_>, area: Rect) -> u16 {
+    let width = area.width.saturating_sub(2) as usize;
+    let height = area.height.saturating_sub(2) as usize;
+    if width == 0 || height == 0 {
+        return 0;
+    }
+    let rendered_rows = text
+        .lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>();
+    rendered_rows.saturating_sub(height).min(u16::MAX as usize) as u16
 }
 
 fn list_index_at(
@@ -1072,12 +1107,12 @@ fn civil_date_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        clean_export_snapshot, encode_base64, format_timestamp, list_index_at, osc52_sequence,
-        render_commands_text, seek_replay,
+        clean_export_snapshot, encode_base64, format_timestamp, list_index_at, max_text_scroll,
+        osc52_sequence, render_commands_text, seek_replay,
     };
     use crate::store::{self, OUTPUT};
     use anyhow::Result;
-    use ratatui::layout::Rect;
+    use ratatui::{layout::Rect, text::Text};
 
     #[test]
     fn clipboard_sequence_contains_base64_path() {
@@ -1117,6 +1152,16 @@ mod tests {
         assert_eq!(list_index_at(area, 12, 9, 4, 3, 20), Some(5));
         assert_eq!(list_index_at(area, 10, 6, 4, 3, 20), None);
         assert_eq!(list_index_at(area, 12, 18, 4, 3, 5), None);
+    }
+
+    #[test]
+    fn text_scroll_stops_at_wrapped_content_end() {
+        let area = Rect::new(0, 0, 12, 5);
+        assert_eq!(max_text_scroll(&Text::raw("one\ntwo"), area), 0);
+        assert_eq!(
+            max_text_scroll(&Text::raw("12345678901\nsecond\nthird"), area),
+            1
+        );
     }
 
     #[test]

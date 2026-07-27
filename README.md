@@ -20,6 +20,14 @@ Open the saved-session menu directly without starting a recording:
 target/release/ascn sessions
 ```
 
+Prebuilt Linux, Windows, and macOS archives are available from the repository's
+GitHub Releases page. Maintainers publish a release by pushing a version tag:
+
+```sh
+git tag -a v0.1.0 -m "asciinematic v0.1.0"
+git push build v0.1.0
+```
+
 ## Live controls
 
 Press `Ctrl-T` twice while recording. The double-key prefix is consumed by

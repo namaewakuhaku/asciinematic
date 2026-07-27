@@ -1,0 +1,107 @@
+name: Build releases
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Linux, Windows, and macOS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust and cross
+        run: |
+          rustup update stable
+          rustup default stable
+          cargo install cross --locked
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Linux and Windows binaries
+        run: |
+          cross build --locked --release --target x86_64-unknown-linux-musl
+          cross build --locked --release --target aarch64-unknown-linux-musl
+          cross build --locked --release --target x86_64-pc-windows-gnu
+
+      # cross cannot distribute Apple SDK images. cargo-zigbuild's official image
+      # includes the SDK and produces a universal Intel + Apple Silicon executable.
+      - name: Build universal macOS binary
+        run: |
+          docker run --rm \
+            --volume "$PWD:/io" \
+            --workdir /io \
+            ghcr.io/rust-cross/cargo-zigbuild \
+            cargo zigbuild --locked --release --target universal2-apple-darwin
+
+      - name: Package binaries
+        run: |
+          mkdir -p \
+            dist/linux-x86_64 \
+            dist/linux-aarch64 \
+            dist/windows-x86_64 \
+            dist/macos-universal
+
+          install -m 0755 \
+            target/x86_64-unknown-linux-musl/release/ascn \
+            dist/linux-x86_64/ascn
+          cp README.md dist/linux-x86_64/
+          tar -C dist/linux-x86_64 -czf \
+            dist/ascn-linux-x86_64.tar.gz .
+
+          install -m 0755 \
+            target/aarch64-unknown-linux-musl/release/ascn \
+            dist/linux-aarch64/ascn
+          cp README.md dist/linux-aarch64/
+          tar -C dist/linux-aarch64 -czf \
+            dist/ascn-linux-aarch64.tar.gz .
+
+          install -m 0755 \
+            target/x86_64-pc-windows-gnu/release/ascn.exe \
+            dist/windows-x86_64/ascn.exe
+          cp README.md dist/windows-x86_64/
+          (
+            cd dist/windows-x86_64
+            zip ../ascn-windows-x86_64.zip ascn.exe README.md
+          )
+
+          install -m 0755 \
+            target/universal2-apple-darwin/release/ascn \
+            dist/macos-universal/ascn
+          cp README.md dist/macos-universal/
+          tar -C dist/macos-universal -czf \
+            dist/ascn-macos-universal.tar.gz .
+
+          (
+            cd dist
+            sha256sum \
+              ascn-linux-x86_64.tar.gz \
+              ascn-linux-aarch64.tar.gz \
+              ascn-windows-x86_64.zip \
+              ascn-macos-universal.tar.gz \
+              > SHA256SUMS
+          )
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ascn-${{ github.ref_name }}
+          compression-level: 0
+          if-no-files-found: error
+          path: |
+            dist/ascn-linux-x86_64.tar.gz
+            dist/ascn-linux-aarch64.tar.gz
+            dist/ascn-windows-x86_64.zip
+            dist/ascn-macos-universal.tar.gz
+            dist/SHA256SUMS

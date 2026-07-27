@@ -156,8 +156,9 @@ command items, but their output history is still recorded.
 
 ## Release builds
 
-The root `.build.yml` is submitted automatically by git.sr.ht when `main` or a
-tag is pushed. It tests the project and publishes checksum-protected archives for:
+The GitHub Actions release workflow runs when `main` or a tag is pushed, and can
+also be started manually. It tests the project and publishes
+checksum-protected workflow artifacts for:
 
 - Linux x86-64 (musl);
 - Linux ARM64 (musl);
@@ -167,4 +168,4 @@ tag is pushed. It tests the project and publishes checksum-protected archives fo
 Linux and Windows are compiled with `cross`. Because its distributed images
 cannot include Apple's SDK, the macOS artifact is compiled with the official
 `cargo-zigbuild` container, which includes the SDK and supports universal
-binaries. All four archives and `SHA256SUMS` appear on the builds.sr.ht job.
+binaries. All four archives and `SHA256SUMS` appear on the workflow run.

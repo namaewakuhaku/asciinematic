@@ -1,4 +1,5 @@
 mod record;
+mod shell;
 mod store;
 mod summary;
 mod text;
@@ -32,9 +33,7 @@ fn run() -> Result<()> {
         );
         return tui::sessions_menu(&data_dir);
     }
-    let shell = env::var_os("SHELL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let shell = shell::user_shell();
     let (_, code) = record::record_new_session(&data_dir, &shell)?;
     if code != 0 {
         std::process::exit(code);

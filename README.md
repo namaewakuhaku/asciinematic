@@ -4,8 +4,8 @@
 menu. It records the complete PTY output timeline and indexes confirmed shell
 commands in a self-contained SQLite session.
 
-Running the program without arguments immediately starts your normal `$SHELL`
-inside the recorder:
+Running the program without arguments immediately starts your normal interactive
+shell inside the recorder:
 
 ```sh
 cargo build --release
@@ -78,7 +78,10 @@ It is buffered from the display and flushed when you return to the terminal.
 
 Configuration is environment-only:
 
-- `SHELL` selects the child shell. It defaults to `/bin/sh`.
+- `SHELL` explicitly selects the child shell when set. Otherwise, Unix uses the
+  current account's configured login shell before falling back to `/bin/sh`.
+  Windows prefers PowerShell 7 (`pwsh`), then Windows PowerShell, `%ComSpec%`,
+  and finally `cmd.exe`.
 - `ASCIINEMATIC_HOME` overrides the storage directory.
 
 On Linux, the default storage location is

@@ -1,7 +1,7 @@
 use std::{
-    env, fs,
+    fs,
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
@@ -104,9 +104,7 @@ pub fn sessions_menu(data_dir: &Path) -> Result<()> {
         match action {
             BrowserExit::Close => return Ok(()),
             BrowserExit::NewSession => {
-                let shell = env::var_os("SHELL")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+                let shell = crate::shell::user_shell();
                 let (_, code) = record::record_new_session(data_dir, &shell)?;
                 if code != 0 {
                     eprintln!("Shell exited with status {code}.");
